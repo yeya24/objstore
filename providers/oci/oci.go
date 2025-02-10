@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,8 +21,9 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/objectstorage/transfer"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/thanos-io/objstore"
 	"gopkg.in/yaml.v2"
+
+	"github.com/thanos-io/objstore"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -30,9 +32,10 @@ const DirDelim = "/"
 type Provider string
 
 const (
-	DefaultConfigProvider           = Provider("default")
-	InstancePrincipalConfigProvider = Provider("instance-principal")
-	RawConfigProvider               = Provider("raw")
+	defaultConfigProvider             = Provider("default")
+	instancePrincipalConfigProvider   = Provider("instance-principal")
+	rawConfigProvider                 = Provider("raw")
+	okeWorkloadIdentityConfigProvider = Provider("oke-workload-identity")
 )
 
 var DefaultConfig = Config{
@@ -56,13 +59,14 @@ type HTTPConfig struct {
 	ResponseHeaderTimeout model.Duration `yaml:"response_header_timeout"`
 	InsecureSkipVerify    bool           `yaml:"insecure_skip_verify"`
 
-	TLSHandshakeTimeout   model.Duration `yaml:"tls_handshake_timeout"`
-	ExpectContinueTimeout model.Duration `yaml:"expect_continue_timeout"`
-	MaxIdleConns          int            `yaml:"max_idle_conns"`
-	MaxIdleConnsPerHost   int            `yaml:"max_idle_conns_per_host"`
-	MaxConnsPerHost       int            `yaml:"max_conns_per_host"`
-	DisableCompression    bool           `yaml:"disable_compression"`
-	ClientTimeout         time.Duration  `yaml:"client_timeout"`
+	TLSHandshakeTimeout   model.Duration    `yaml:"tls_handshake_timeout"`
+	ExpectContinueTimeout model.Duration    `yaml:"expect_continue_timeout"`
+	MaxIdleConns          int               `yaml:"max_idle_conns"`
+	MaxIdleConnsPerHost   int               `yaml:"max_idle_conns_per_host"`
+	MaxConnsPerHost       int               `yaml:"max_conns_per_host"`
+	DisableCompression    bool              `yaml:"disable_compression"`
+	ClientTimeout         time.Duration     `yaml:"client_timeout"`
+	Transport             http.RoundTripper `yaml:"-"`
 }
 
 // Config stores the configuration for oci bucket.
@@ -92,12 +96,18 @@ type Bucket struct {
 	requestMetadata common.RequestMetadata
 }
 
+func (b *Bucket) Provider() objstore.ObjProvider { return objstore.OCI }
+
 // Name returns the bucket name for the provider.
 func (b *Bucket) Name() string {
 	return b.name
 }
 
-// Iter calls f for each entry in the given directory (not recursive). The argument to f is the full
+func (b *Bucket) SupportedIterOptions() []objstore.IterOptionType {
+	return []objstore.IterOptionType{objstore.Recursive}
+}
+
+// Iter calls f for each entry in the given directory. The argument to f is the full
 // object name including the prefix of the inspected directory.
 func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
 	// Ensure the object name actually ends with a dir suffix. Otherwise we'll just iterate the
@@ -117,6 +127,7 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error, opt
 		if objectName == "" || objectName == dir {
 			continue
 		}
+
 		if err := f(objectName); err != nil {
 			return err
 		}
@@ -125,13 +136,28 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error, opt
 	return nil
 }
 
+func (b *Bucket) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	if err := objstore.ValidateIterOptions(b.SupportedIterOptions(), options...); err != nil {
+		return err
+	}
+
+	return b.Iter(ctx, dir, func(name string) error {
+		return f(objstore.IterObjectAttributes{Name: name})
+	}, options...)
+}
+
 // Get returns a reader for the given object name.
 func (b *Bucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	response, err := getObject(ctx, *b, name, "")
 	if err != nil {
 		return nil, err
 	}
-	return response.Content, nil
+	return objstore.ObjectSizerReadCloser{
+		ReadCloser: response.Content,
+		Size: func() (int64, error) {
+			return *response.ContentLength, nil
+		},
+	}, nil
 }
 
 // GetRange returns a new range reader for the given object name and range.
@@ -161,7 +187,11 @@ func (b *Bucket) GetRange(ctx context.Context, name string, offset, length int64
 	if err != nil {
 		return nil, err
 	}
-	return response.Content, nil
+	return objstore.ObjectSizerReadCloser{ReadCloser: response.Content,
+		Size: func() (int64, error) {
+			return *response.ContentLength, nil
+		},
+	}, nil
 }
 
 // Upload the contents of the reader as an object into the bucket.
@@ -225,6 +255,15 @@ func (b *Bucket) IsObjNotFoundErr(err error) bool {
 	return false
 }
 
+// IsAccessDeniedErr returns true if access to object is denied.
+func (b *Bucket) IsAccessDeniedErr(err error) bool {
+	failure, isServiceError := common.IsServiceError(err)
+	if isServiceError {
+		return failure.GetHTTPStatusCode() == http.StatusForbidden
+	}
+	return false
+}
+
 // ObjectSize returns the size of the specified object.
 func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
 	response, err := getObject(ctx, *b, name, "")
@@ -277,7 +316,7 @@ func (b *Bucket) deleteBucket(ctx context.Context) (err error) {
 }
 
 // NewBucket returns a new Bucket using the provided oci config values.
-func NewBucket(logger log.Logger, ociConfig []byte) (*Bucket, error) {
+func NewBucket(logger log.Logger, ociConfig []byte, wrapRoundtripper func(http.RoundTripper) http.RoundTripper) (*Bucket, error) {
 	level.Debug(logger).Log("msg", "creating new oci bucket connection")
 	var config = DefaultConfig
 	var configurationProvider common.ConfigurationProvider
@@ -290,30 +329,49 @@ func NewBucket(logger log.Logger, ociConfig []byte) (*Bucket, error) {
 	provider := Provider(strings.ToLower(config.Provider))
 	level.Info(logger).Log("msg", "creating OCI client", "provider", provider)
 	switch provider {
-	case DefaultConfigProvider:
+	case defaultConfigProvider:
 		configurationProvider = common.DefaultConfigProvider()
-	case InstancePrincipalConfigProvider:
+	case instancePrincipalConfigProvider:
 		configurationProvider, err = auth.InstancePrincipalConfigurationProvider()
 		if err != nil {
 			return nil, errors.Wrapf(err, "unable to create OCI instance principal config provider")
 		}
-	case RawConfigProvider:
+	case rawConfigProvider:
 		if err := config.validateConfig(); err != nil {
 			return nil, errors.Wrapf(err, "invalid oci configurations")
 		}
 		configurationProvider = common.NewRawConfigurationProvider(config.Tenancy, config.User, config.Region,
 			config.Fingerprint, config.PrivateKey, &config.Passphrase)
+	case okeWorkloadIdentityConfigProvider:
+		if err := os.Setenv(auth.ResourcePrincipalVersionEnvVar, auth.ResourcePrincipalVersion2_2); err != nil {
+			return nil, errors.Wrapf(err, "unable to set environment variable: %s", auth.ResourcePrincipalVersionEnvVar)
+		}
+		if err := os.Setenv(auth.ResourcePrincipalRegionEnvVar, config.Region); err != nil {
+			return nil, errors.Wrapf(err, "unable to set environment variable: %s", auth.ResourcePrincipalRegionEnvVar)
+		}
+
+		configurationProvider, err = auth.OkeWorkloadIdentityConfigurationProvider()
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to create OKE workload identity config provider")
+		}
 	default:
-		return nil, errors.Wrapf(err, fmt.Sprintf("unsupported OCI provider: %s", provider))
+		return nil, fmt.Errorf("unsupported OCI provider: %s", provider)
 	}
 
 	client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(configurationProvider)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to create ObjectStorage client with the given oci configurations")
 	}
-
+	var rt http.RoundTripper
+	rt = CustomTransport(config)
+	if config.HTTPConfig.Transport != nil {
+		rt = config.HTTPConfig.Transport
+	}
+	if wrapRoundtripper != nil {
+		rt = wrapRoundtripper(rt)
+	}
 	httpClient := http.Client{
-		Transport: CustomTransport(config),
+		Transport: rt,
 		Timeout:   config.HTTPConfig.ClientTimeout,
 	}
 	client.HTTPClient = &httpClient
@@ -352,7 +410,7 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 		return nil, nil, err
 	}
 
-	bkt, err := NewBucket(log.NewNopLogger(), ociConfig)
+	bkt, err := NewBucket(log.NewNopLogger(), ociConfig, nil)
 	if err != nil {
 		return nil, nil, err
 	}

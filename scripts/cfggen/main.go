@@ -5,27 +5,29 @@ package main
 
 import (
 	"fmt"
+	"github.com/thanos-io/objstore"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 
-	"github.com/thanos-io/objstore/providers/oci"
-
-	"github.com/fatih/structtag"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"github.com/thanos-io/objstore/client"
 	"github.com/thanos-io/objstore/providers/azure"
 	"github.com/thanos-io/objstore/providers/bos"
 	"github.com/thanos-io/objstore/providers/cos"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/objstore/providers/gcs"
+	"github.com/thanos-io/objstore/providers/obs"
+	"github.com/thanos-io/objstore/providers/oci"
 	"github.com/thanos-io/objstore/providers/oss"
 	"github.com/thanos-io/objstore/providers/s3"
 	"github.com/thanos-io/objstore/providers/swift"
+
+	"github.com/fatih/structtag"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/pkg/errors"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v2"
 )
@@ -34,16 +36,17 @@ var (
 	configs        map[string]interface{}
 	possibleValues []string
 
-	bucketConfigs = map[client.ObjProvider]interface{}{
-		client.AZURE:      azure.Config{},
-		client.GCS:        gcs.Config{},
-		client.S3:         s3.DefaultConfig,
-		client.SWIFT:      swift.DefaultConfig,
-		client.COS:        cos.DefaultConfig,
-		client.ALIYUNOSS:  oss.Config{},
-		client.FILESYSTEM: filesystem.Config{},
-		client.BOS:        bos.Config{},
-		client.OCI:        oci.Config{},
+	bucketConfigs = map[objstore.ObjProvider]interface{}{
+		objstore.AZURE:      azure.Config{},
+		objstore.GCS:        gcs.Config{},
+		objstore.S3:         s3.DefaultConfig,
+		objstore.SWIFT:      swift.DefaultConfig,
+		objstore.COS:        cos.DefaultConfig,
+		objstore.ALIYUNOSS:  oss.Config{},
+		objstore.FILESYSTEM: filesystem.Config{},
+		objstore.BOS:        bos.Config{},
+		objstore.OCI:        oci.Config{},
+		objstore.OBS:        obs.DefaultConfig,
 	}
 )
 
